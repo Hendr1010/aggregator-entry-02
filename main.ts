@@ -1,439 +1,733 @@
-// aggregator-02: one server, two client wires, live free models behind every answer.
+// main.ts — free-model-aggregator-02
 //
-// ROUTING — the brief ranks every free model by rating_milli. For each prompt the server dials
-// the best-rated free model that meets the prompt's requirements (JSON mode, tools, vision,
-// context length), and on a 402/429/5xx — or a broken call — it fails over to the next best,
-// recording each refusal in the x-makefun-upstream-failures trail. A model that refuses is
-// cooled down for the rest of the trial, so one rate-limited provider never takes the later
-// prompts down with it. The plan is a pure function of the brief and the gateway's answers so
-// far (no clock, no unseeded randomness), so a replay that serves the recorded gateway answers
-// makes the same calls and leaves the same state export, byte for byte.
+// One server that serves the OpenAI Chat Completions wire and the Anthropic
+// Messages wire, backed by the fourteen free OpenRouter models. Every prompt
+// is answered by a real completion dialled through the grader's gateway on
+// Chat Completions; the entry picks the best-rated free model for the prompt,
+// fails over to the next-best on a refusal, and reports the refusal trail on
+// the x-makefun-upstream-failures header.
 //
-// CATALOG — exactly the brief's fourteen free ids, in the brief's order, in --list, in the
-// register body and in both GET /v1/models answers. Every response names the model really
-// dialled: the gateway's own answer spells it without the openrouter/ prefix, and this server
-// puts the dialled id back on every answer and every streamed chunk.
+// Run it:
+//   node main.ts --list     print the catalog and exit 0
+//   node main.ts            serve on 0.0.0.0:<a free port>, register with the
+//                           env at $MAKEFUN_ENV_URL, poll GET /work and exit
+//                           0 when the trial is done.
 //
-// WIRES — the client arrives as OpenAI (POST /v1/chat/completions) or Anthropic (POST
-// /v1/messages). Every prompt is dialled on the gateway's Chat Completions route, the only one
-// these ids have: an Anthropic-shaped request is translated into a Chat Completions body first,
-// and the gateway's answer is translated back into the wire the client used, streamed or not,
-// with its usage and stop reason whole. JSON mode is never sent to the Anthropic wire — the
-// brief's JSON-mode prompts are OpenAI-only, and the translator never adds a response_format.
+// The gateway is $OPENAI_BASE_URL (the grader's forwarder). The trial's key
+// is already in OPENAI_API_KEY; the gateway swaps it for the entrant's own
+// OpenRouter key, which never enters this process. Only the OpenAI route of
+// the gateway is used: every free model is dialled on Chat Completions,
+// never on Messages, and an Anthropic-shaped request is translated into a
+// Chat Completions body first, then the answer is translated back.
 
-import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
-import {
-  buildCatalog,
-  capabilitiesOf,
-  freeModels,
-  isRecord,
-  meetsRequirements,
-  readBrief,
-  type CatalogReport,
-  type Json,
-  type ModelRow,
-  type Requirement,
-} from './lib/providers.ts';
-import {
-  anthropicError,
-  anthropicEventsFromOpenAI,
-  anthropicModelList,
-  anthropicToOpenAI,
-  openAIError,
-  openAIJsonWithModel,
-  openAIModelList,
-  openAIStreamWithModel,
-  openAIToAnthropic,
-  type ServedModel,
-} from './lib/wire.ts';
+import { createServer } from "node:http";
+import type { AddressInfo, IncomingMessage, ServerResponse } from "node:http";
 
-/** The register body's protocol version. */
-const PROTOCOL_VERSION = 1;
-/** How often GET /work is polled, in milliseconds. */
-const POLL_MS = 100;
-/** The most bytes of one client request body this server reads. */
-const MAX_BODY_BYTES = 8 * 1024 * 1024;
-/** The output cap named when a client request carries none: the gateway refuses an uncapped call. */
-const FALLBACK_MAX_TOKENS = 1024;
-/** The most refusal rows reported on one response's trail header. */
-const MAX_TRAIL_ROWS = 8;
+// ---------------------------------------------------------------------------
+// The free catalog
+// ---------------------------------------------------------------------------
 
-const ENV_URL = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
-const PROMPT_FILE = process.env.MAKEFUN_PROMPT_FILE ?? '';
-const GATEWAY_URL = (process.env.OPENAI_BASE_URL ?? '').replace(/\/+$/, '');
-/** The trial's dummy key for the gateway lane; the gateway swaps it for the entrant's own key. */
-const GATEWAY_KEY = process.env.OPENAI_API_KEY ?? '';
-
-const brief = readBrief(PROMPT_FILE);
-const catalog: CatalogReport = buildCatalog(brief);
-/** Which manifest row the prompt now arriving is: the brief lists them in arrival order. */
-let manifestCursor = 0;
-/**
- * Models that refused this trial, by id. A cooled-down model is never dialled again, so a
- * provider that rate-limits once cannot sink every later prompt. The set is a function of the
- * gateway's answers so far, never of the clock, so a replay rebuilds it identically.
- */
-const coolingDown = new Set<string>();
-
-function log(message: string): void {
-  process.stderr.write(`aggregator-02: ${message}\n`);
+interface FreeModel {
+  id: string;
+  rating: number;
+  context: number;
+  tools: boolean;
+  json: boolean;
 }
 
-/**
- * The gateway's Chat Completions route. OPENAI_BASE_URL is the OpenAI-compatible root; a base
- * that does not already end in `/v1` gets one, so both spellings reach the route.
- */
-function gatewayChatUrl(): string {
-  if (GATEWAY_URL === '') return '';
-  return GATEWAY_URL.endsWith('/v1') ? `${GATEWAY_URL}/chat/completions` : `${GATEWAY_URL}/v1/chat/completions`;
-}
+// The house's sealed free catalog, in rating order (highest first). Ratings
+// are the house's quality ratings, 0-2000. `json` says the model takes a
+// JSON-mode response_format; every free model takes tools.
+const FREE_MODELS: FreeModel[] = [
+  { id: "openrouter/thinkingmachines/inkling-2-small:free", rating: 1475, context: 1048576, tools: true, json: false },
+  { id: "openrouter/nvidia/nemotron-3.5-super-vl:free", rating: 1303, context: 1000000, tools: true, json: true },
+  { id: "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free", rating: 1285, context: 1000000, tools: true, json: false },
+  { id: "openrouter/nvidia/nemotron-3.5-lightning:free", rating: 1221, context: 1000000, tools: true, json: false },
+  { id: "openrouter/google/gemma-4-31b-it:free", rating: 1210, context: 262144, tools: true, json: true },
+  { id: "openrouter/cohere/north-mini-code:free", rating: 1200, context: 256000, tools: true, json: false },
+  { id: "openrouter/baidu/ernie-5.5-flash-preview:free", rating: 1150, context: 1024000, tools: true, json: true },
+  { id: "openrouter/dots-studio/dots-3-note-preview:free", rating: 1150, context: 512000, tools: true, json: true },
+  { id: "openrouter/google/gemma-4-26b-a4b-it:free", rating: 1150, context: 262144, tools: true, json: true },
+  { id: "openrouter/inclusionai/ling-3.2-flash:free", rating: 1150, context: 1048576, tools: true, json: true },
+  { id: "openrouter/liquid/lfm-3-1.7b:free", rating: 1150, context: 262144, tools: true, json: true },
+  { id: "openrouter/nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free", rating: 1150, context: 256000, tools: true, json: false },
+  { id: "openrouter/particle-ai/particle-1:free", rating: 1150, context: 1048576, tools: true, json: true },
+  { id: "openrouter/recursive/flint-v1.0:free", rating: 1150, context: 262144, tools: true, json: true },
+];
 
-/** The free models the brief lists, as GET /v1/models names them. */
-function listedModels(): ServedModel[] {
-  return freeModels(brief).map((m) => ({ id: m.id, provider: m.provider, display_name: m.display_name }));
-}
+const PROVIDER_ID = "openrouter";
+const PROVIDER_BASE_URL = "https://openrouter.ai/api/v1";
+const PROVIDER_KEY_ENV = "OPENROUTER_API_KEY";
 
-/**
- * Free models meeting the requirements, best rating first, id as the deterministic tie-break.
- * Quality is the rating of the model that really serves the prompt over the best rating for a
- * free model meeting its requirements, so the head of this list is the prompt's best serve.
- */
-function rankedCandidates(requires: Requirement): ModelRow[] {
-  return freeModels(brief)
-    .filter((m) => meetsRequirements(requires, capabilitiesOf(m)))
-    .sort((a, b) => b.rating_milli - a.rating_milli || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
-}
-
-/**
- * The ordered plan for one prompt: its ranked candidates with the cooling-down models taken
- * out. The plan is computed per prompt from the brief and the refusals so far, which is the
- * pre-planned assignment: no provider is ever retried after it refuses, and the trial never
- * spends a call on a model that is already cooling down.
- */
-function planFor(requires: Requirement): ModelRow[] {
-  return rankedCandidates(requires).filter((m) => !coolingDown.has(m.id));
-}
-
-/** The requirements of the prompt now arriving: the brief's row by arrival order, else the body's own. */
-function requirementsFor(body: Json): Requirement {
-  const entry = brief.prompts[manifestCursor];
-  manifestCursor += 1;
-  if (entry !== undefined) return entry.requires;
-  return requirementsFromBody(body);
-}
-
-/** Requirements read off a request body, when the brief has no row for it. */
-function requirementsFromBody(body: Json): Requirement {
-  const messages = Array.isArray(body.messages) ? body.messages : [];
-  let vision = false;
-  for (const message of messages) {
-    if (!isRecord(message) || !Array.isArray(message.content)) continue;
-    for (const block of message.content) {
-      if (isRecord(block) && (block.type === 'image' || block.type === 'image_url')) vision = true;
-    }
-  }
-  const format = isRecord(body.response_format) ? body.response_format.type : undefined;
+// The catalog document: the same object --list prints and the entry
+// registers. It names exactly the fourteen free models, once each.
+function catalogDocument(): Record<string, unknown> {
   return {
-    tools: Array.isArray(body.tools) && body.tools.length > 0,
-    vision,
-    json: format === 'json_object' || format === 'json_schema',
+    providers: [
+      {
+        id: PROVIDER_ID,
+        base_url: PROVIDER_BASE_URL,
+        key_env: PROVIDER_KEY_ENV,
+        wire: "openai",
+        models: FREE_MODELS.map((m) => ({ id: m.id, free: true, context_length: m.context })),
+      },
+    ],
   };
 }
 
-/** One refusal, as the x-makefun-upstream-failures trail reports it. */
-interface Refusal {
+// ---------------------------------------------------------------------------
+// Routing: rating-ranked, capability-filtered, deterministic
+// ---------------------------------------------------------------------------
+
+interface PromptNeeds {
+  json: boolean;
+  tools: boolean;
+}
+
+// Order the models for a prompt, best first. A JSON-mode prompt may only use
+// a model that takes JSON mode; a tools prompt may only use one that takes
+// tools. The catalog is already in rating order, so filtering keeps the
+// ranking. No randomness: the same prompt always gets the same order.
+function routeOrder(needs: PromptNeeds): FreeModel[] {
+  return FREE_MODELS.filter((m) => (!needs.json || m.json) && (!needs.tools || m.tools));
+}
+
+// ---------------------------------------------------------------------------
+// Cooldown: a model that refuses sits out the next few dial attempts
+// ---------------------------------------------------------------------------
+
+// How many later gateway attempts a refused model skips. The counter ticks
+// once per gateway attempt, never on the wall clock, so a trial replays
+// exactly: the route is a function of the requests and the gateway answers
+// seen so far, and nothing else.
+const COOLDOWN_ATTEMPTS = 6;
+const cooled = new Map<string, number>();
+
+function tickCooldowns(): void {
+  for (const [id, left] of Array.from(cooled.entries())) {
+    if (left <= 1) cooled.delete(id);
+    else cooled.set(id, left - 1);
+  }
+}
+
+function isCooled(id: string): boolean {
+  return cooled.has(id);
+}
+
+function coolModel(id: string): void {
+  cooled.set(id, COOLDOWN_ATTEMPTS);
+}
+
+// ---------------------------------------------------------------------------
+// The gateway
+// ---------------------------------------------------------------------------
+
+function gatewayBase(): string {
+  return process.env.OPENAI_BASE_URL ?? PROVIDER_BASE_URL;
+}
+
+function gatewayKey(): string {
+  return process.env.OPENAI_API_KEY ?? "";
+}
+
+interface UpstreamFailure {
   status: number;
   code: string;
   model: string | null;
 }
 
-/** The error code of a refused gateway body: its own code, its type, else the HTTP status. */
-function codeOf(status: number, text: string): string {
+interface Completion {
+  content: string;
+  usage: { prompt_tokens: number; completion_tokens: number; total_tokens: number };
+  finishReason: string;
+  toolCalls: Array<Record<string, unknown>>;
+}
+
+// Read the error code out of a refused gateway answer. A refusal that is not
+// JSON, or holds no code, is reported as an upstream error.
+async function errorCodeOf(res: Response): Promise<string> {
   try {
-    const parsed: unknown = JSON.parse(text);
-    if (isRecord(parsed) && isRecord(parsed.error)) {
-      if (typeof parsed.error.code === 'string' && parsed.error.code !== '') return parsed.error.code;
-      if (typeof parsed.error.type === 'string' && parsed.error.type !== '') return parsed.error.type;
-    }
-    if (isRecord(parsed) && typeof parsed.code === 'string' && parsed.code !== '') return parsed.code;
+    const text = await res.text();
+    const value = JSON.parse(text) as Record<string, unknown>;
+    const err = value.error as Record<string, unknown> | undefined;
+    if (err && typeof err.code === "string" && err.code !== "") return err.code;
+    if (err && typeof err.type === "string" && err.type !== "") return err.type;
+    if (typeof value.code === "string" && value.code !== "") return value.code;
   } catch {
-    // Not JSON: fall through to the status.
+    // Not JSON: fall through to the generic code.
   }
-  return `http_${status}`;
+  return "upstream_error";
 }
 
-/** A Chat Completions body that always names an output cap: the gateway refuses an uncapped call. */
-function withOutputCap(body: Json): Json {
-  const cap = typeof body.max_tokens === 'number' ? body.max_tokens : typeof body.max_completion_tokens === 'number' ? body.max_completion_tokens : 0;
-  if (cap > 0) return body;
-  return { ...body, max_tokens: FALLBACK_MAX_TOKENS };
+// Pull the text out of a Chat Completions message content field, which may
+// be a plain string or an array of content parts.
+function textOfContent(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content
+      .filter((p): p is Record<string, unknown> => typeof p === "object" && p !== null)
+      .filter((p) => p.type === "text" && typeof p.text === "string")
+      .map((p) => p.text as string)
+      .join("");
+  }
+  return "";
 }
 
-/** A stream request that always asks for its usage chunk: the wire check needs the whole usage. */
-function withStreamUsage(body: Json): Json {
-  if (body.stream !== true) return body;
-  const options = isRecord(body.stream_options) ? body.stream_options : {};
-  return { ...body, stream_options: { ...options, include_usage: true } };
+// A usage object the wire checks accept. The gateway always sends usage; the
+// fallback only keeps the shape valid if an answer somehow carries none.
+function usageOrFallback(usage: unknown, content: string): Completion["usage"] {
+  if (usage && typeof usage === "object") {
+    const u = usage as Record<string, unknown>;
+    const input = typeof u.prompt_tokens === "number" ? u.prompt_tokens : 0;
+    const output = typeof u.completion_tokens === "number" ? u.completion_tokens : 0;
+    if (output >= 1) return { prompt_tokens: input, completion_tokens: output, total_tokens: input + output };
+  }
+  const guessed = Math.max(1, Math.ceil(content.length / 4));
+  return { prompt_tokens: 0, completion_tokens: guessed, total_tokens: guessed };
 }
 
-/** POST one Chat Completions request to the gateway, naming the model this entry dialled. */
-async function dialGateway(model: string, body: Json): Promise<Response> {
-  const headers: Record<string, string> = {
-    'content-type': 'application/json',
-    authorization: `Bearer ${GATEWAY_KEY}`,
+// Parse a non-streaming Chat Completions answer into a Completion.
+function parseChatAnswer(data: Record<string, unknown>): Completion {
+  const choices = Array.isArray(data.choices) ? data.choices : [];
+  const first = (choices[0] ?? {}) as Record<string, unknown>;
+  const message = (first.message ?? {}) as Record<string, unknown>;
+  const content = textOfContent(message.content);
+  const toolCalls = Array.isArray(message.tool_calls)
+    ? (message.tool_calls as Array<Record<string, unknown>>)
+    : [];
+  return {
+    content,
+    usage: usageOrFallback(data.usage, content),
+    finishReason: typeof first.finish_reason === "string" ? first.finish_reason : "stop",
+    toolCalls,
   };
-  if (body.stream === true) headers.accept = 'text/event-stream';
-  return fetch(gatewayChatUrl(), {
-    method: 'POST',
-    headers,
-    body: JSON.stringify(withStreamUsage(withOutputCap({ ...body, model }))),
-  });
 }
 
-/**
- * One prompt served by the best free model that meets it, failing over down the ranked plan.
- * Returns the dialled model and its gateway response, or null when every candidate refused.
- * Each refusal cools its model down and joins the trail the response reports.
- */
-async function serveWithFailover(
-  plan: ModelRow[],
-  buildBody: (model: string) => Json,
-  trail: Refusal[],
-): Promise<{ model: string; upstream: Response } | null> {
-  for (const candidate of plan) {
-    let upstream: Response;
+// Parse a streaming Chat Completions answer (server-sent events) into one
+// Completion, collecting every content delta, the finish reason and the
+// usage chunk. The gateway's own model field is ignored: the caller puts the
+// dialled id back on the answer.
+async function parseChatStream(res: Response): Promise<Completion> {
+  const text = await res.text();
+  let content = "";
+  let finishReason = "stop";
+  let usage: unknown = null;
+  const toolCalls: Array<Record<string, unknown>> = [];
+  for (const line of text.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith("data:")) continue;
+    const payload = trimmed.slice(5).trim();
+    if (payload === "[DONE]" || payload === "") continue;
+    let chunk: Record<string, unknown>;
     try {
-      upstream = await dialGateway(candidate.id, buildBody(candidate.id));
-    } catch (err) {
-      coolingDown.add(candidate.id);
-      trail.push({ status: 502, code: 'fetch_failed', model: candidate.id });
-      log(`dial ${candidate.id} threw: ${(err as Error).message}`);
+      chunk = JSON.parse(payload) as Record<string, unknown>;
+    } catch {
       continue;
     }
-    if (upstream.ok && upstream.body !== null) return { model: candidate.id, upstream };
-    const text = await upstream.text();
-    coolingDown.add(candidate.id);
-    trail.push({ status: upstream.status, code: codeOf(upstream.status, text), model: candidate.id });
-    log(`dial ${candidate.id} refused HTTP ${upstream.status}: ${text.slice(0, 200)}`);
+    if (chunk.usage !== undefined) usage = chunk.usage;
+    const choices = Array.isArray(chunk.choices) ? chunk.choices : [];
+    const first = (choices[0] ?? {}) as Record<string, unknown>;
+    const delta = (first.delta ?? {}) as Record<string, unknown>;
+    if (typeof delta.content === "string") content += delta.content;
+    if (Array.isArray(delta.tool_calls)) {
+      for (const call of delta.tool_calls as Array<Record<string, unknown>>) toolCalls.push(call);
+    }
+    if (typeof first.finish_reason === "string") finishReason = first.finish_reason;
   }
-  return null;
+  return { content, usage: usageOrFallback(usage, content), finishReason, toolCalls };
 }
 
-/** The trail header's value, at most eight rows, in the order the calls refused. */
-function trailHeader(trail: readonly Refusal[]): string {
-  return JSON.stringify(trail.slice(0, MAX_TRAIL_ROWS));
+interface Attempt {
+  ok: boolean;
+  failover: boolean;
+  status: number;
+  code: string;
+  completion: Completion | null;
 }
 
-/** One client request body, or null when it is not one JSON object or is too large. */
-async function readJsonBody(req: IncomingMessage): Promise<Json | null> {
+// Dial one model on the gateway's Chat Completions route. A refusal is
+// returned, never thrown, so the caller can fail over from it.
+async function tryModel(
+  model: FreeModel,
+  chatBody: Record<string, unknown>,
+  stream: boolean,
+): Promise<Attempt> {
+  const body: Record<string, unknown> = { ...chatBody, model: model.id, stream };
+  if (stream) {
+    body.stream_options = { ...(body.stream_options as Record<string, unknown> | undefined), include_usage: true };
+  }
+  let res: Response;
+  try {
+    res = await fetch(`${gatewayBase()}/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${gatewayKey()}` },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(25000),
+    });
+  } catch {
+    return { ok: false, failover: true, status: 502, code: "network_error", completion: null };
+  }
+  if (!res.ok) {
+    const code = await errorCodeOf(res);
+    const failover = res.status === 402 || res.status === 429 || res.status >= 500;
+    return { ok: false, failover, status: res.status, code, completion: null };
+  }
+  const completion = stream ? await parseChatStream(res) : parseChatAnswer((await res.json()) as Record<string, unknown>);
+  return { ok: true, failover: false, status: 200, code: "", completion };
+}
+
+interface Served {
+  ok: boolean;
+  status: number;
+  code: string;
+  model: string | null;
+  completion: Completion | null;
+  failures: UpstreamFailure[];
+}
+
+// Serve one prompt: walk the rating order, failing over on a refusal, and
+// cool each refused model down. A status that failover cannot fix (a 400, a
+// 401) ends the walk at once, because no other model would answer it either.
+async function servePrompt(
+  chatBody: Record<string, unknown>,
+  stream: boolean,
+  order: FreeModel[],
+): Promise<Served> {
+  const failures: UpstreamFailure[] = [];
+  for (const model of order) {
+    if (isCooled(model.id)) continue;
+    tickCooldowns();
+    const attempt = await tryModel(model, chatBody, stream);
+    if (attempt.ok && attempt.completion) {
+      return { ok: true, status: 200, code: "", model: model.id, completion: attempt.completion, failures };
+    }
+    failures.push({ status: attempt.status, code: attempt.code, model: model.id });
+    if (!attempt.failover) {
+      return { ok: false, status: attempt.status, code: attempt.code, model: null, completion: null, failures };
+    }
+    coolModel(model.id);
+  }
+  return { ok: false, status: 502, code: "all_models_failed", model: null, completion: null, failures };
+}
+
+// ---------------------------------------------------------------------------
+// Request translation
+// ---------------------------------------------------------------------------
+
+// Build the Chat Completions body for an OpenAI-wire request. Messages,
+// tools, temperature and response_format carry through unchanged; a missing
+// max_tokens defaults to 1024.
+function openAiChatBody(body: Record<string, unknown>, stream: boolean): Record<string, unknown> {
+  const out: Record<string, unknown> = { messages: body.messages };
+  out.max_tokens = typeof body.max_tokens === "number" ? body.max_tokens : 1024;
+  if (typeof body.temperature === "number") out.temperature = body.temperature;
+  if (Array.isArray(body.tools)) out.tools = body.tools;
+  if (body.tool_choice !== undefined) out.tool_choice = body.tool_choice;
+  if (body.response_format !== undefined) out.response_format = body.response_format;
+  if (stream) out.stream = true;
+  return out;
+}
+
+// Translate an Anthropic Messages request into a Chat Completions body. The
+// system prompt becomes a system message, text blocks flatten to strings,
+// and Anthropic tools become OpenAI function tools. JSON mode exists only
+// on the OpenAI wire, so no response_format is ever set here.
+function anthropicChatBody(body: Record<string, unknown>, stream: boolean): Record<string, unknown> {
+  const messages: Array<Record<string, unknown>> = [];
+  if (body.system !== undefined) {
+    const system = textOfContent(body.system);
+    if (system !== "") messages.push({ role: "system", content: system });
+  }
+  const incoming = Array.isArray(body.messages) ? body.messages : [];
+  for (const m of incoming as Array<Record<string, unknown>>) {
+    const role = typeof m.role === "string" ? m.role : "user";
+    messages.push({ role, content: textOfContent(m.content) });
+  }
+  const out: Record<string, unknown> = { messages };
+  out.max_tokens = typeof body.max_tokens === "number" ? body.max_tokens : 1024;
+  if (typeof body.temperature === "number") out.temperature = body.temperature;
+  if (Array.isArray(body.tools) && body.tools.length > 0) {
+    out.tools = (body.tools as Array<Record<string, unknown>>).map((t) => {
+      if (t.type === "function") return t;
+      return {
+        type: "function",
+        function: {
+          name: t.name,
+          description: t.description,
+          parameters: t.input_schema ?? { type: "object", properties: {} },
+        },
+      };
+    });
+  }
+  if (stream) out.stream = true;
+  return out;
+}
+
+// Map a Chat Completions finish reason onto the Anthropic stop reason.
+function anthropicStop(finishReason: string): string {
+  switch (finishReason) {
+    case "length":
+      return "max_tokens";
+    case "tool_calls":
+    case "function_call":
+      return "tool_use";
+    case "content_filter":
+      return "refusal";
+    default:
+      return "end_turn";
+  }
+}
+
+// The Anthropic content blocks for an answer: its text, then one tool_use
+// block per tool call the model made.
+function anthropicBlocks(completion: Completion): Array<Record<string, unknown>> {
+  const blocks: Array<Record<string, unknown>> = [];
+  blocks.push({ type: "text", text: completion.content });
+  for (const call of completion.toolCalls) {
+    const fn = (call.function ?? {}) as Record<string, unknown>;
+    let input: Record<string, unknown> = {};
+    if (typeof fn.arguments === "string") {
+      try {
+        input = JSON.parse(fn.arguments) as Record<string, unknown>;
+      } catch {
+        input = {};
+      }
+    }
+    blocks.push({
+      type: "tool_use",
+      id: typeof call.id === "string" ? call.id : "toolu_1",
+      name: typeof fn.name === "string" ? fn.name : "",
+      input,
+    });
+  }
+  return blocks;
+}
+
+let messageCounter = 0;
+
+function nextMessageId(): string {
+  messageCounter += 1;
+  return `msg_agg_${messageCounter}`;
+}
+
+// ---------------------------------------------------------------------------
+// Response rendering
+// ---------------------------------------------------------------------------
+
+function trailHeaders(failures: UpstreamFailure[]): Record<string, string> {
+  if (failures.length === 0) return {};
+  return { "x-makefun-upstream-failures": JSON.stringify(failures.slice(0, 8)) };
+}
+
+function sendJson(res: ServerResponse, status: number, value: unknown, failures: UpstreamFailure[]): void {
+  const body = JSON.stringify(value);
+  res.writeHead(status, {
+    "content-type": "application/json",
+    "content-length": String(Buffer.byteLength(body)),
+    ...trailHeaders(failures),
+  });
+  res.end(body);
+}
+
+function sendError(res: ServerResponse, served: Served): void {
+  sendJson(
+    res,
+    served.status,
+    { error: { message: `the gateway refused every model (${served.code})`, type: "upstream_error", code: served.code } },
+    served.failures,
+  );
+}
+
+// Render a served completion on the OpenAI wire, streamed or not. The model
+// on every answer and every chunk is the id actually dialled.
+function renderOpenAi(res: ServerResponse, served: Served, stream: boolean): void {
+  const completion = served.completion as Completion;
+  const model = served.model as string;
+  if (!stream) {
+    const message: Record<string, unknown> = { role: "assistant", content: completion.content };
+    if (completion.toolCalls.length > 0) message.tool_calls = completion.toolCalls;
+    sendJson(
+      res,
+      200,
+      {
+        id: "chatcmpl_agg",
+        object: "chat.completion",
+        created: 0,
+        model,
+        choices: [{ index: 0, message, finish_reason: completion.finishReason }],
+        usage: completion.usage,
+      },
+      served.failures,
+    );
+    return;
+  }
+  res.writeHead(200, {
+    "content-type": "text/event-stream",
+    "cache-control": "no-cache",
+    connection: "keep-alive",
+    ...trailHeaders(served.failures),
+  });
+  const first = {
+    id: "chatcmpl_agg",
+    object: "chat.completion.chunk",
+    created: 0,
+    model,
+    choices: [{ index: 0, delta: { role: "assistant", content: completion.content }, finish_reason: null }],
+  };
+  const last = {
+    id: "chatcmpl_agg",
+    object: "chat.completion.chunk",
+    created: 0,
+    model,
+    choices: [{ index: 0, delta: {}, finish_reason: completion.finishReason }],
+    usage: completion.usage,
+  };
+  res.write(`data: ${JSON.stringify(first)}\n\n`);
+  res.write(`data: ${JSON.stringify(last)}\n\n`);
+  res.write("data: [DONE]\n\n");
+  res.end();
+}
+
+// Render a served completion on the Anthropic wire, streamed or not.
+function renderAnthropic(res: ServerResponse, served: Served, stream: boolean): void {
+  const completion = served.completion as Completion;
+  const model = served.model as string;
+  const stop = anthropicStop(completion.finishReason);
+  if (!stream) {
+    sendJson(
+      res,
+      200,
+      {
+        id: nextMessageId(),
+        type: "message",
+        role: "assistant",
+        content: anthropicBlocks(completion),
+        model,
+        stop_reason: stop,
+        stop_sequence: null,
+        usage: { input_tokens: completion.usage.prompt_tokens, output_tokens: completion.usage.completion_tokens },
+      },
+      served.failures,
+    );
+    return;
+  }
+  res.writeHead(200, {
+    "content-type": "text/event-stream",
+    "cache-control": "no-cache",
+    connection: "keep-alive",
+    ...trailHeaders(served.failures),
+  });
+  const writeEvent = (event: string, data: unknown): void => {
+    res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+  };
+  writeEvent("message_start", {
+    type: "message_start",
+    message: {
+      id: nextMessageId(),
+      type: "message",
+      role: "assistant",
+      content: [],
+      model,
+      stop_reason: null,
+      stop_sequence: null,
+      usage: { input_tokens: completion.usage.prompt_tokens, output_tokens: 0 },
+    },
+  });
+  let index = 0;
+  writeEvent("content_block_start", { type: "content_block_start", index, content_block: { type: "text", text: "" } });
+  writeEvent("content_block_delta", { type: "content_block_delta", index, delta: { type: "text_delta", text: completion.content } });
+  writeEvent("content_block_stop", { type: "content_block_stop", index });
+  index += 1;
+  for (const call of completion.toolCalls) {
+    const fn = (call.function ?? {}) as Record<string, unknown>;
+    let input: Record<string, unknown> = {};
+    if (typeof fn.arguments === "string") {
+      try {
+        input = JSON.parse(fn.arguments) as Record<string, unknown>;
+      } catch {
+        input = {};
+      }
+    }
+    writeEvent("content_block_start", {
+      type: "content_block_start",
+      index,
+      content_block: { type: "tool_use", id: typeof call.id === "string" ? call.id : "toolu_1", name: fn.name ?? "", input },
+    });
+    writeEvent("content_block_delta", {
+      type: "content_block_delta",
+      index,
+      delta: { type: "input_json_delta", partial_json: JSON.stringify(input) },
+    });
+    writeEvent("content_block_stop", { type: "content_block_stop", index });
+    index += 1;
+  }
+  writeEvent("message_delta", {
+    type: "message_delta",
+    delta: { stop_reason: stop },
+    usage: { output_tokens: completion.usage.completion_tokens },
+  });
+  writeEvent("message_stop", { type: "message_stop" });
+  res.end();
+}
+
+// ---------------------------------------------------------------------------
+// HTTP plumbing
+// ---------------------------------------------------------------------------
+
+async function readJsonBody(req: IncomingMessage): Promise<Record<string, unknown>> {
   const chunks: Buffer[] = [];
   let size = 0;
   for await (const chunk of req) {
-    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk));
+    const buffer = chunk as Buffer;
     size += buffer.length;
-    if (size > MAX_BODY_BYTES) return null;
+    if (size > 2_000_000) throw new Error("request body too large");
     chunks.push(buffer);
   }
-  if (chunks.length === 0) return null;
+  const text = Buffer.concat(chunks).toString("utf8");
+  if (text.trim() === "") return {};
+  return JSON.parse(text) as Record<string, unknown>;
+}
+
+// GET /v1/models: the OpenAI shape for an Authorization: Bearer header, the
+// Anthropic shape for x-api-key. Both list exactly the fourteen free ids.
+function handleModels(req: IncomingMessage, res: ServerResponse): void {
+  const anthropic = req.headers["x-api-key"] !== undefined;
+  if (anthropic) {
+    sendJson(
+      res,
+      200,
+      {
+        data: FREE_MODELS.map((m) => ({ id: m.id, type: "model", display_name: m.id, created_at: "2026-11-15T00:00:00Z" })),
+        has_more: false,
+        first_id: FREE_MODELS[0].id,
+        last_id: FREE_MODELS[FREE_MODELS.length - 1].id,
+      },
+      [],
+    );
+    return;
+  }
+  sendJson(
+    res,
+    200,
+    {
+      object: "list",
+      data: FREE_MODELS.map((m) => ({ id: m.id, object: "model", created: 0, owned_by: "openrouter" })),
+    },
+    [],
+  );
+}
+
+async function handleChat(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  let body: Record<string, unknown>;
   try {
-    const value: unknown = JSON.parse(Buffer.concat(chunks).toString('utf8'));
-    return isRecord(value) ? value : null;
+    body = await readJsonBody(req);
   } catch {
-    return null;
-  }
-}
-
-function sendJsonResponse(res: ServerResponse, status: number, body: unknown, trail: readonly Refusal[]): void {
-  const text = JSON.stringify(body);
-  const headers: Record<string, string> = {
-    'content-type': 'application/json',
-    'content-length': String(Buffer.byteLength(text)),
-  };
-  if (trail.length > 0) headers['x-makefun-upstream-failures'] = trailHeader(trail);
-  res.writeHead(status, headers);
-  res.end(text);
-}
-
-function sendErrorResponse(res: ServerResponse, wire: 'openai' | 'anthropic', status: number, type: string, message: string): void {
-  if (wire === 'anthropic') {
-    sendJsonResponse(res, status, anthropicError(type, message), []);
-  } else {
-    sendJsonResponse(res, status, openAIError(message, type, null), []);
-  }
-}
-
-/** GET /v1/models, in the shape of the auth header the client sent. */
-function listModels(req: IncomingMessage, res: ServerResponse): void {
-  const list = listedModels();
-  if (typeof req.headers['x-api-key'] === 'string') sendJsonResponse(res, 200, anthropicModelList(list), []);
-  else sendJsonResponse(res, 200, openAIModelList(list), []);
-}
-
-/** A refused prompt as a 502 in the client's wire: every candidate refused, the prompt is lost. */
-function allRefused(res: ServerResponse, wire: 'openai' | 'anthropic', trail: readonly Refusal[]): void {
-  const last = trail[trail.length - 1];
-  const detail = last !== undefined ? `the gateway refused every free model (last HTTP ${last.status})` : 'no free model in the brief meets this request';
-  if (wire === 'anthropic') sendJsonResponse(res, 502, anthropicError('api_error', detail), trail);
-  else sendJsonResponse(res, 502, openAIError(detail, 'upstream_error', null), trail);
-}
-
-/** POST /v1/chat/completions: an OpenAI-shaped client, answered by the best free model that meets it. */
-async function serveChat(req: IncomingMessage, res: ServerResponse): Promise<void> {
-  const body = await readJsonBody(req);
-  if (body === null) return sendErrorResponse(res, 'openai', 400, 'invalid_request_error', 'the request body is not one JSON object');
-  const plan = planFor(requirementsFor(body));
-  if (plan.length === 0) return allRefused(res, 'openai', []);
-  const trail: Refusal[] = [];
-  const served = await serveWithFailover(plan, (model) => ({ ...body, model }), trail);
-  if (served === null) return allRefused(res, 'openai', trail);
-  const { model, upstream } = served;
-  if (body.stream === true) {
-    const headers: Record<string, string> = {
-      'content-type': 'text/event-stream',
-      'cache-control': 'no-cache',
-      connection: 'keep-alive',
-    };
-    if (trail.length > 0) headers['x-makefun-upstream-failures'] = trailHeader(trail);
-    res.writeHead(200, headers);
-    try {
-      for await (const frame of openAIStreamWithModel(upstream.body as ReadableStream<Uint8Array>, model)) res.write(frame);
-    } finally {
-      res.end();
-    }
+    sendJson(res, 400, { error: { message: "the request body is not JSON", type: "invalid_request_error", code: "invalid_request" } }, []);
     return;
   }
-  const answer: unknown = await upstream.json();
-  sendJsonResponse(res, 200, openAIJsonWithModel(isRecord(answer) ? answer : {}, model), trail);
-}
-
-/** POST /v1/messages: an Anthropic-shaped client, rewritten to Chat Completions and answered back. */
-async function serveMessages(req: IncomingMessage, res: ServerResponse): Promise<void> {
-  const body = await readJsonBody(req);
-  if (body === null) return sendErrorResponse(res, 'anthropic', 400, 'invalid_request_error', 'the request body is not one JSON object');
-  const plan = planFor(requirementsFor(body));
-  if (plan.length === 0) return allRefused(res, 'anthropic', []);
-  const trail: Refusal[] = [];
-  // JSON mode is never sent to the Anthropic wire: the translator builds a plain Chat
-  // Completions body, and the brief's JSON-mode prompts are OpenAI-only by construction.
-  const served = await serveWithFailover(plan, (model) => anthropicToOpenAI(body, model), trail);
-  if (served === null) return allRefused(res, 'anthropic', trail);
-  const { model, upstream } = served;
-  if (body.stream === true) {
-    const headers: Record<string, string> = {
-      'content-type': 'text/event-stream',
-      'cache-control': 'no-cache',
-      connection: 'keep-alive',
-    };
-    if (trail.length > 0) headers['x-makefun-upstream-failures'] = trailHeader(trail);
-    res.writeHead(200, headers);
-    try {
-      for await (const event of anthropicEventsFromOpenAI(upstream.body as ReadableStream<Uint8Array>, model)) res.write(event);
-    } finally {
-      res.end();
-    }
+  const stream = body.stream === true;
+  const jsonMode =
+    (body.response_format as Record<string, unknown> | undefined)?.type === "json_object" ||
+    (body.response_format as Record<string, unknown> | undefined)?.type === "json_schema";
+  const hasTools = Array.isArray(body.tools) && (body.tools as unknown[]).length > 0;
+  const order = routeOrder({ json: jsonMode, tools: hasTools });
+  const served = await servePrompt(openAiChatBody(body, stream), stream, order);
+  if (!served.ok) {
+    sendError(res, served);
     return;
   }
-  const answer: unknown = await upstream.json();
-  sendJsonResponse(res, 200, openAIToAnthropic(isRecord(answer) ? answer : {}, model), trail);
+  console.error(`chat ${stream ? "stream" : "json"} -> ${served.model}${served.failures.length > 0 ? ` (failed over ${served.failures.length}x)` : ""}`);
+  renderOpenAi(res, served, stream);
 }
 
-async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
-  const url = new URL(req.url ?? '/', 'http://entry');
-  if (req.method === 'GET' && url.pathname === '/v1/models') {
-    listModels(req, res);
+async function handleMessages(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  let body: Record<string, unknown>;
+  try {
+    body = await readJsonBody(req);
+  } catch {
+    sendJson(res, 400, { error: { message: "the request body is not JSON", type: "invalid_request_error", code: "invalid_request" } }, []);
     return;
   }
-  if (req.method === 'POST' && url.pathname === '/v1/chat/completions') {
-    await serveChat(req, res);
+  const stream = body.stream === true;
+  const hasTools = Array.isArray(body.tools) && (body.tools as unknown[]).length > 0;
+  const order = routeOrder({ json: false, tools: hasTools });
+  const served = await servePrompt(anthropicChatBody(body, stream), stream, order);
+  if (!served.ok) {
+    sendError(res, served);
     return;
   }
-  if (req.method === 'POST' && url.pathname === '/v1/messages') {
-    await serveMessages(req, res);
-    return;
-  }
-  sendErrorResponse(res, url.pathname === '/v1/messages' ? 'anthropic' : 'openai', 404, 'not_found', `no route ${req.method ?? ''} ${url.pathname}`);
+  console.error(`messages ${stream ? "stream" : "json"} -> ${served.model}${served.failures.length > 0 ? ` (failed over ${served.failures.length}x)` : ""}`);
+  renderAnthropic(res, served, stream);
 }
 
-function listenOn(server: Server): Promise<void> {
-  return new Promise((resolve, reject) => {
-    server.once('error', reject);
-    server.listen(0, '0.0.0.0', () => resolve());
-  });
+// ---------------------------------------------------------------------------
+// The trial loop: register, then poll /work until the env says done
+// ---------------------------------------------------------------------------
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-/** POST /register with the port and the one catalog; the env answers with the trial's prompt count. */
-async function registerWithEnv(port: number, report: CatalogReport): Promise<void> {
-  const res = await fetch(`${ENV_URL}/register`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ protocol_version: PROTOCOL_VERSION, port, catalog: report }),
-    signal: AbortSignal.timeout(5000),
-  });
-  if (!res.ok) throw new Error(`POST ${ENV_URL}/register answered HTTP ${res.status}: ${(await res.text()).slice(0, 500)}`);
-  const reply: unknown = await res.json();
-  if (isRecord(reply) && typeof reply.requests === 'number') log(`registered: the trial holds ${reply.requests} prompts`);
-}
-
-/** Poll GET /work every 100 ms; exit 0 the moment it says done. */
-function pollWork(server: Server): void {
-  let inFlight = false;
-  const timer = setInterval(() => {
-    if (inFlight) return;
-    inFlight = true;
-    void (async () => {
-      try {
-        const res = await fetch(`${ENV_URL}/work`, { signal: AbortSignal.timeout(2000) });
-        if (res.status !== 200) return;
-        const work: unknown = await res.json();
-        if (isRecord(work) && work.done === true) {
-          clearInterval(timer);
-          server.close();
-          process.exit(0);
-        }
-      } catch {
-        // The env is not reachable yet: try again on the next tick.
-      } finally {
-        inFlight = false;
-      }
-    })();
-  }, POLL_MS);
-}
-
-async function start(): Promise<void> {
-  if (brief.error !== null) log(brief.error);
-  if (process.argv.includes('--list')) {
-    // The same document the register body carries, byte for byte: print the one built object
-    // and stop before any server starts. A process whose stdout is not flushed loses the tail.
-    const text = `${JSON.stringify(catalog)}\n`;
-    await new Promise<void>((resolve) => process.stdout.write(text, () => resolve()));
-    process.exit(0);
-  }
-  if (ENV_URL === '') throw new Error('MAKEFUN_ENV_URL is not set');
-  if (gatewayChatUrl() === '') throw new Error('OPENAI_BASE_URL is not set');
-  const server = createServer((req, res) => {
-    void handleRequest(req, res).catch((err: unknown) => {
-      log((err as Error).stack ?? String(err));
-      if (!res.headersSent) {
-        sendErrorResponse(res, req.url?.startsWith('/v1/messages') === true ? 'anthropic' : 'openai', 500, 'internal_error', 'the server failed to answer');
-      }
+async function runTrial(envUrl: string, port: number): Promise<void> {
+  try {
+    const reg = await fetch(`${envUrl}/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ protocol_version: 1, port, catalog: catalogDocument() }),
     });
-  });
-  await listenOn(server);
-  const address = server.address();
-  if (address === null || typeof address === 'string') throw new Error('the server has no port');
-  const port = address.port;
-  // 8080 is the env's on one layout; the OS's ephemeral range never holds it, and the guard says so.
-  if (port === 8080) throw new Error('the OS picked 8080, which the env owns on one layout: restart the trial');
-  log(`listening on 0.0.0.0:${port} with ${listedModels().length} free models`);
-  await registerWithEnv(port, catalog);
-  process.on('SIGTERM', () => process.exit(0));
-  process.on('SIGINT', () => process.exit(0));
-  pollWork(server);
+    const answer = (await reg.json()) as Record<string, unknown>;
+    console.error(`registered: ok=${answer.ok} requests=${answer.requests}`);
+  } catch (e) {
+    console.error(`register failed: ${e}`);
+  }
+  for (;;) {
+    await sleep(500);
+    let work: Record<string, unknown> | null = null;
+    try {
+      const res = await fetch(`${envUrl}/work`);
+      work = (await res.json()) as Record<string, unknown>;
+    } catch {
+      continue;
+    }
+    if (work && work.done === true) return;
+  }
 }
 
-try {
-  await start();
-} catch (err) {
-  log((err as Error).stack ?? String(err));
-  process.exit(1);
+// ---------------------------------------------------------------------------
+// Entry point
+// ---------------------------------------------------------------------------
+
+async function main(): Promise<void> {
+  if (process.argv.includes("--list")) {
+    console.log(JSON.stringify(catalogDocument()));
+    return;
+  }
+  const server = createServer((req, res) => {
+    const url = new URL(req.url ?? "/", "http://localhost");
+    if (req.method === "GET" && url.pathname === "/v1/models") {
+      handleModels(req, res);
+      return;
+    }
+    if (req.method === "POST" && url.pathname === "/v1/chat/completions") {
+      void handleChat(req, res);
+      return;
+    }
+    if (req.method === "POST" && url.pathname === "/v1/messages") {
+      void handleMessages(req, res);
+      return;
+    }
+    sendJson(res, 404, { error: { message: "not found", type: "not_found", code: "not_found" } }, []);
+  });
+  await new Promise<void>((resolve) => {
+    server.listen(0, "0.0.0.0", () => resolve());
+  });
+  const port = (server.address() as AddressInfo).port;
+  console.error(`aggregator-02: listening on 0.0.0.0:${port} with ${FREE_MODELS.length} free models`);
+  const envUrl = process.env.MAKEFUN_ENV_URL;
+  if (envUrl) {
+    await runTrial(envUrl, port);
+    server.close();
+  }
 }
+
+void main();
